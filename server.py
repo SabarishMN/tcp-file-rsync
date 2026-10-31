@@ -11,7 +11,16 @@ PORT = 9001
 DEST_DIR = "received_files"
 
 BUFFER_SIZE = 4096
+file_locks = {}
+file_locks_guard = threading.Lock()
 
+
+def get_file_lock(file_path):
+    with file_locks_guard:
+        if file_path not in file_locks:
+            file_locks[file_path] = threading.Lock()
+
+        return file_locks[file_path]
 
 def receive_file(sock, destination_path, file_size, expected_hash):
     os.makedirs(
@@ -79,8 +88,15 @@ def handle_client(conn):
 
         filename = metadata["filename"]
         client_hash = metadata["sha256"]
+        file_size = metadata["size"]
 
-        # Resolve the destination path
+        if (
+            not isinstance(file_size, int)
+            or isinstance(file_size, bool)
+            or file_size < 0
+        ):
+            raise ValueError("Invalid file size")
+
         destination_root = os.path.realpath(DEST_DIR)
 
         destination_path = os.path.realpath(
@@ -92,59 +108,74 @@ def handle_client(conn):
         ) != destination_root:
             raise ValueError("Invalid destination path")
 
-        print(f"\n[CHECK] {filename}")
-        print("[DEBUG] Checking destination file", flush=True)
-        print("[DEBUG] Path:", destination_path, flush=True)
-        print("[DEBUG] Exists:", os.path.isfile(destination_path), flush=True)
-
-        if os.path.isfile(destination_path):
-            print("[DEBUG] Starting SHA-256 calculation", flush=True)
-            server_hash = calculate_sha256(
-                destination_path
-            )
-            print("[DEBUG] SHA-256 calculation completed", flush=True)
-
-            if server_hash == client_hash:
-                print("[SKIP] File unchanged")
-
-                send_json(conn, {
-                    "status": "SKIP"
-                })
-                print("[DEBUG] SKIP response transmitted", flush=True)
-
-                continue
-
-        print("[SEND] File missing or modified")
-
-        file_size = metadata["size"]
-
-        if (
-            not isinstance(file_size, int)
-            or isinstance(file_size, bool)
-            or file_size < 0
-        ):
-            raise ValueError("Invalid file size")
-
-        send_json(conn, {
-            "status": "SEND"
-        })
-
-        print("[DEBUG] SEND response transmitted", flush=True)
-
-        bytes_received = receive_file(
-            conn,
-            destination_path,
-            file_size,
-            client_hash
+        print(
+            f"\n[CHECK] {filename} "
+            f"[Thread: {threading.current_thread().name}]"
         )
 
-        print(f"[RECEIVED] {bytes_received} bytes")
-        print("[VERIFIED] SHA-256 checksum matched")
+        # Get the lock with the destination file
+        file_lock = get_file_lock(destination_path)
 
-        send_json(conn, {
-            "status": "STORED"
-        })
+        # Protect checksum comparison AND file replacement
+        with file_lock:
 
+            if os.path.isfile(destination_path):
+                server_hash = calculate_sha256(
+                    destination_path
+                )
+
+                if server_hash == client_hash:
+                    print(f"[SKIP] {filename}")
+
+                    send_json(conn, {
+                        "status": "SKIP"
+                    })
+
+                    continue
+
+            print(f"[SEND] {filename}")
+
+            send_json(conn, {
+                "status": "SEND"
+            })
+
+            bytes_received = receive_file(
+                conn,
+                destination_path,
+                file_size,
+                client_hash
+            )
+
+            print(
+                f"[RECEIVED] {filename}: "
+                f"{bytes_received} bytes"
+            )
+
+            send_json(conn, {
+                "status": "STORED"
+            })
+
+def client_worker(conn, addr):
+    print(
+        f"[CONNECTED] {addr} "
+        f"[Thread: {threading.current_thread().name}]"
+    )
+
+    try:
+        with conn:
+            handle_client(conn)
+
+    except (
+        ConnectionError,
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError
+    ) as error:
+        print(f"[ERROR] Client {addr}: {error}")
+
+    finally:
+        print(f"[DISCONNECTED] {addr}")
 
 def start_server():
     os.makedirs(DEST_DIR, exist_ok=True)
@@ -170,22 +201,13 @@ def start_server():
         while True:
             conn, addr = server.accept()
 
-            print(f"\n[CONNECTED] {addr}")
+            thread = threading.Thread(
+                target=client_worker,
+                args=(conn, addr),
+                daemon=True
+            )
 
-            try:
-                with conn:
-                    handle_client(conn)
-
-            except (
-                ConnectionError,
-                OSError,
-                ValueError,
-                KeyError,
-                TypeError
-            ) as error:
-                print(f"[ERROR] {error}")
-
-            print(f"[DISCONNECTED] {addr}")
+            thread.start()
 
 
 if __name__ == "__main__":
